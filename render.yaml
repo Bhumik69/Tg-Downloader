@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: telegram-downloader-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python combined_bot.py
+    healthCheckPath: /ping
