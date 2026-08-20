@@ -22,7 +22,7 @@ from telethon import TelegramClient
 BOT_TOKEN = "7991103091:AAHUauqaRLSAiwy3U2NOagCiDfDh1UBEcF0"
 
 ACCOUNTS = [
-    {"name": "Account 1", "api_id": 22476344, "api_hash": "1d98fd4acfbb8bd59c66ba104b423cb9", "session": "MahdiAshtian"},
+    {"name": "Account 1", "api_id": 22476344, "api_hash": "1d98fd4acfbb8bd59c66ba104b423cb9", "session": "mahdiashtian"},
     {"name": "Account 2", "api_id": 19989378, "api_hash": "b85b6b543d548b6bbfaa41ab619534dd", "session": "user_session"},
 ]
 
