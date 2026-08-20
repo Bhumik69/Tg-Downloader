@@ -338,8 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Usage:\n"
         "/download <telegram_link>\n"
         "/download <telegram_link> <count>\n"
-        "/speedtest - test Render server speed\n"
-        "/cleanup - delete old downloaded files"
+        "/speedtest - test Render server speed"
     )
 
 
@@ -393,52 +392,6 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     )
 
-
-
-
-# ============================================================
-# CLEANUP COMMAND
-# ============================================================
-
-async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete all temporary downloaded files inside SAVE_DIR only."""
-    deleted = 0
-    freed = 0
-    failed = 0
-
-    if os.path.isdir(SAVE_DIR):
-        for root, dirs, files in os.walk(SAVE_DIR, topdown=False):
-            for filename in files:
-                path = os.path.join(root, filename)
-
-                try:
-                    freed += os.path.getsize(path)
-                    os.remove(path)
-                    deleted += 1
-                except Exception as exc:
-                    failed += 1
-                    print(f"Cleanup could not delete {path}: {exc}")
-
-            # Remove empty subdirectories, but preserve SAVE_DIR itself.
-            for dirname in dirs:
-                path = os.path.join(root, dirname)
-
-                try:
-                    os.rmdir(path)
-                except OSError:
-                    pass
-
-    freed_mb = freed / (1024 * 1024)
-    freed_gb = freed / (1024 * 1024 * 1024)
-
-    await update.message.reply_text(
-        "🗑️ Cleanup completed!\n\n"
-        f"Files deleted: {deleted}\n"
-        f"Failed: {failed}\n"
-        f"Space cleared: {freed_mb:.2f} MB "
-        f"({freed_gb:.3f} GB)\n\n"
-        f"Only the {SAVE_DIR}/ download directory was cleaned."
-    )
 
 
 # ============================================================
@@ -764,7 +717,6 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("download", download))
     application.add_handler(CommandHandler("speedtest", speedtest_command))
-    application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CallbackQueryHandler(refresh_progress, pattern=r"^refresh:"))
 
     await application.initialize()
