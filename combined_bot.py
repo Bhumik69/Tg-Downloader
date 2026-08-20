@@ -400,11 +400,29 @@ async def start_web_server():
 # ============================================================
 
 async def main():
-    # Start every configured Telethon account.
+    # Connect every configured Telethon account WITHOUT interactive login.
+    # Each .session file must already exist and be authorized.
     for account in clients:
-        await account["client"].start()
-        me = await account["client"].get_me()
-        print(f'{account["name"]} logged in as {getattr(me, "id", "unknown")}')
+        telethon_client = account["client"]
+
+        await telethon_client.connect()
+
+        if not await telethon_client.is_user_authorized():
+            session_file = getattr(
+                telethon_client.session,
+                "filename",
+                "configured .session file",
+            )
+            raise RuntimeError(
+                f'{account["name"]} session is missing or not authorized: '
+                f'{session_file}. Interactive phone/OTP login is disabled.'
+            )
+
+        me = await telethon_client.get_me()
+        print(
+            f'{account["name"]} logged in as '
+            f'{getattr(me, "id", "unknown")}'
+        )
 
     # Start HTTP server required by Render Web Service.
     web_runner = await start_web_server()
