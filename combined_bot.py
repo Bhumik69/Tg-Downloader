@@ -146,6 +146,23 @@ async def refresh_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("Refresh progress error:", exc)
 
 
+async def safe_delete_bot_message(chat_id, message_id):
+    """Delete a temporary bot message without breaking the job if Telegram rejects it."""
+    if not message_id:
+        return
+
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except Exception as exc:
+        print(
+            f"Could not delete temporary message "
+            f"{chat_id}/{message_id}: {exc}"
+        )
+
+
 async def send_message_to_user(user_id, msg):
     downloaded_path = None
     progress_id = None
@@ -214,23 +231,56 @@ async def send_message_to_user(user_id, msg):
                     pass
 
                 caption = msg.text or ""
+                sent_message = None
+
                 with open(downloaded_path, "rb") as media_file:
                     lower_path = downloaded_path.lower()
-                    if lower_path.endswith((".jpg", ".jpeg", ".png")):
-                        await bot.send_photo(chat_id=user_id, photo=media_file, caption=caption)
-                    elif lower_path.endswith((".mp4", ".mkv")):
-                        await bot.send_video(chat_id=user_id, video=media_file, caption=caption)
-                    else:
-                        await bot.send_document(chat_id=user_id, document=media_file, caption=caption)
 
-                print("Sent:", downloaded_path)
+                    if lower_path.endswith((".jpg", ".jpeg", ".png")):
+                        sent_message = await bot.send_photo(
+                            chat_id=user_id,
+                            photo=media_file,
+                            caption=caption,
+                        )
+                    elif lower_path.endswith((".mp4", ".mkv")):
+                        sent_message = await bot.send_video(
+                            chat_id=user_id,
+                            video=media_file,
+                            caption=caption,
+                        )
+                    else:
+                        sent_message = await bot.send_document(
+                            chat_id=user_id,
+                            document=media_file,
+                            caption=caption,
+                        )
+
+                # Telegram has accepted the final media message.
+                print(
+                    "Sent:",
+                    downloaded_path,
+                    "message_id:",
+                    getattr(sent_message, "message_id", None),
+                )
+
                 state["status"] = "Completed"
-                try:
-                    await progress_message.edit_text(
-                        build_progress_text(state) + "\n\n✅ File sent successfully."
+
+                # Remove the local Render copy immediately after a successful send.
+                if downloaded_path and os.path.exists(downloaded_path):
+                    try:
+                        os.remove(downloaded_path)
+                        print("Deleted local media:", downloaded_path)
+                        downloaded_path = None
+                    except OSError as exc:
+                        print("Local media cleanup error:", exc)
+
+                # Remove the temporary progress bar/Refresh message.
+                if progress_message:
+                    await safe_delete_bot_message(
+                        user_id,
+                        progress_message.message_id,
                     )
-                except Exception:
-                    pass
+                    progress_message = None
 
     except Exception as exc:
         print("Error while sending message:", exc)
@@ -252,7 +302,6 @@ async def send_message_to_user(user_id, msg):
             except OSError:
                 pass
         if progress_id:
-            await asyncio.sleep(2)
             download_progress.pop(progress_id, None)
 
 
@@ -289,7 +338,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Usage:\n"
         "/download <telegram_link>\n"
         "/download <telegram_link> <count>\n"
-        "/speedtest - test Render server speed"
+        "/speedtest - test Render server speed\n"
+        "/cleanup - delete old downloaded files"
     )
 
 
@@ -328,18 +378,67 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_chat.id
 
+    queued_message = await update.message.reply_text(
+        f"✅ Queued ({count} message(s))"
+    )
+
     await download_queue.put(
         {
             "link": link,
             "count": count,
             "user_id": user_id,
+            # Only bot-generated temporary messages are tracked.
+            # The user's original /download message is never deleted.
+            "temp_message_ids": [queued_message.message_id],
         }
     )
 
-    await update.message.reply_text(
-        f"✅ Queued ({count} message(s))"
-    )
 
+
+
+# ============================================================
+# CLEANUP COMMAND
+# ============================================================
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete all temporary downloaded files inside SAVE_DIR only."""
+    deleted = 0
+    freed = 0
+    failed = 0
+
+    if os.path.isdir(SAVE_DIR):
+        for root, dirs, files in os.walk(SAVE_DIR, topdown=False):
+            for filename in files:
+                path = os.path.join(root, filename)
+
+                try:
+                    freed += os.path.getsize(path)
+                    os.remove(path)
+                    deleted += 1
+                except Exception as exc:
+                    failed += 1
+                    print(f"Cleanup could not delete {path}: {exc}")
+
+            # Remove empty subdirectories, but preserve SAVE_DIR itself.
+            for dirname in dirs:
+                path = os.path.join(root, dirname)
+
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+
+    freed_mb = freed / (1024 * 1024)
+    freed_gb = freed / (1024 * 1024 * 1024)
+
+    await update.message.reply_text(
+        "🗑️ Cleanup completed!\n\n"
+        f"Files deleted: {deleted}\n"
+        f"Failed: {failed}\n"
+        f"Space cleared: {freed_mb:.2f} MB "
+        f"({freed_gb:.3f} GB)\n\n"
+        f"Only the {SAVE_DIR}/ download directory was cleaned."
+    )
 
 
 # ============================================================
@@ -440,50 +539,140 @@ async def speedtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_worker():
     print("Download worker started.")
+
     while True:
         job = await download_queue.get()
+        job_succeeded = False
+
         try:
-            link, count, user_id = job["link"], job["count"], job["user_id"]
+            link = job["link"]
+            count = job["count"]
+            user_id = job["user_id"]
+            temp_message_ids = job.setdefault("temp_message_ids", [])
+
             chat_part, start_id = parse_link(link)
+
             if not chat_part:
-                await bot.send_message(chat_id=user_id, text="❌ Invalid Telegram link.")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Invalid Telegram link.",
+                )
                 continue
-            chat_id = int(f"-100{chat_part}") if chat_part.isdigit() else chat_part
+
+            chat_id = (
+                int(f"-100{chat_part}")
+                if chat_part.isdigit()
+                else chat_part
+            )
+
             current = int(start_id)
-            selected, first_msg = await find_accessible_client(chat_id, current)
+            selected, first_msg = await find_accessible_client(
+                chat_id,
+                current,
+            )
+
             if not selected:
-                await bot.send_message(chat_id=user_id, text="❌ None of the configured Telegram accounts can access this message.")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "❌ None of the configured Telegram accounts "
+                        "can access this message."
+                    ),
+                )
                 continue
-            await bot.send_message(chat_id=user_id, text=f'🔐 Using {selected["name"]}\n✅ Download started ({count} message(s))')
+
+            account_message = await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f'🔐 Using {selected["name"]}\n'
+                    f'✅ Download started ({count} message(s))'
+                ),
+            )
+            temp_message_ids.append(account_message.message_id)
+
             downloaded = 0
+
             try:
                 await send_message_to_user(user_id, first_msg)
-                downloaded, current = 1, current + 1
+                downloaded = 1
+                current += 1
             except Exception:
                 pass
+
             while downloaded < count:
-                ok = await process_message_with_client(selected, chat_id, current, user_id)
+                ok = await process_message_with_client(
+                    selected,
+                    chat_id,
+                    current,
+                    user_id,
+                )
+
                 if not ok:
-                    fallback, msg = await find_accessible_client(chat_id, current)
-                    if fallback and msg:
+                    fallback, fallback_msg = await find_accessible_client(
+                        chat_id,
+                        current,
+                    )
+
+                    if fallback and fallback_msg:
                         selected = fallback
+
                         try:
-                            await send_message_to_user(user_id, msg)
+                            await send_message_to_user(
+                                user_id,
+                                fallback_msg,
+                            )
                             ok = True
                         except Exception as exc:
                             print("Fallback send failed:", exc)
+
                 if ok:
                     downloaded += 1
+
                 current += 1
                 await asyncio.sleep(1)
-            await bot.send_message(chat_id=user_id, text=f'✅ Finished sending {downloaded} message(s).\nLast account used: {selected["name"]}')
+
+            job_succeeded = downloaded >= count
+
+            if job_succeeded:
+                # Successful job: remove all bot-generated queue/account
+                # status messages. The user's /download command and the
+                # delivered media/messages remain in chat.
+                for message_id in list(temp_message_ids):
+                    await safe_delete_bot_message(
+                        user_id,
+                        message_id,
+                    )
+
+                temp_message_ids.clear()
+
         except Exception as exc:
             print("Worker error:", exc)
+
             try:
-                await bot.send_message(chat_id=job["user_id"], text=f"❌ Download failed: {exc}")
+                await bot.send_message(
+                    chat_id=job["user_id"],
+                    text=f"❌ Download failed: {exc}",
+                )
             except Exception:
                 pass
+
         finally:
+            # Defensive filesystem cleanup. This only removes temporary
+            # downloaded media inside SAVE_DIR. It never touches .session files.
+            try:
+                if os.path.isdir(SAVE_DIR):
+                    for filename in os.listdir(SAVE_DIR):
+                        path = os.path.join(SAVE_DIR, filename)
+
+                        if os.path.isfile(path):
+                            try:
+                                os.remove(path)
+                                print("Deleted leftover local file:", path)
+                            except OSError as exc:
+                                print("Leftover cleanup error:", exc)
+            except Exception as exc:
+                print("SAVE_DIR cleanup error:", exc)
+
             download_queue.task_done()
 
 
@@ -575,6 +764,7 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("download", download))
     application.add_handler(CommandHandler("speedtest", speedtest_command))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CallbackQueryHandler(refresh_progress, pattern=r"^refresh:"))
 
     await application.initialize()
