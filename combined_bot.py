@@ -22,7 +22,7 @@ from telethon import TelegramClient
 # ============================================================
 
 # Fake/reference credentials. Replace with your own.
-BOT_TOKEN = "7991103091:AAHUauqaRLSAiwy3U2NOagCiDfDh1UBEcF0"
+BOT_TOKEN = "7991103091:AAEwq2gcibypJq2Z9gy9UaagOQ2Z0EENm_Y"
 
 ACCOUNTS = [
     {"name": "Account 1", "api_id": 22476344, "api_hash": "1d98fd4acfbb8bd59c66ba104b423cb9", "session": "mahdiashtian2"},
