@@ -5,6 +5,7 @@ import time
 import secrets
 
 import aiohttp
+from dotenv import load_dotenv
 from aiohttp import web
 from telegram import Bot, Update
 from telegram.ext import (
@@ -26,6 +27,8 @@ from telethon.errors import (
 )
 from gen_session import SessionLogin
 from session_store import UpstashSessionStore
+
+load_dotenv()
 
 
 # ============================================================
@@ -336,6 +339,7 @@ async def find_accessible_client(chat_id, msg_id):
                 return account, msg
         except Exception as exc:
             print(f'{account["name"]} cannot access {chat_id}/{msg_id}: {exc}')
+            await verify_session(account)
     return None, None
 
 
@@ -347,6 +351,7 @@ async def process_message_with_client(account, chat_id, msg_id, user_id):
             return True
     except Exception as exc:
         print(f'{account["name"]} failed on message {msg_id}: {exc}')
+        await verify_session(account)
     return False
 
 
@@ -355,7 +360,7 @@ async def process_message_with_client(account, chat_id, msg_id, user_id):
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    unavailable = [account["name"] for account in clients if not account["available"]]
+    unavailable = [account["name"] for account in clients if account.get("session_status") == "dead"]
     session_notice = ""
     if unavailable:
         session_notice = (
@@ -368,6 +373,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Usage:\n"
         "/download <telegram_link>\n"
         "/download <telegram_link> <count>\n"
+        "/verify - check both user sessions\n"
         "/speedtest - test Render server speed"
         + session_notice
     )
@@ -380,6 +386,97 @@ def is_session_admin(update: Update) -> bool:
         and update.effective_chat
         and update.effective_chat.type == "private"
     )
+
+
+async def notify_session_dead(account):
+    if account.get("dead_notified") or not ADMIN_USER_IDS or not bot:
+        return
+    text = (
+        f"⚠️ {account['name']} Telegram session is dead or unauthorized. "
+        "Open a private chat with the bot and run /generate to replace it."
+    )
+    sent = False
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=text)
+            sent = True
+        except Exception as exc:
+            print(f"Could not notify admin about {account['name']}: {type(exc).__name__}")
+    if sent:
+        account["dead_notified"] = True
+
+
+async def verify_session(account, notify=True):
+    client = account["client"]
+    try:
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            account["available"] = False
+            account["session_status"] = "dead"
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            if notify:
+                await notify_session_dead(account)
+            return "dead"
+
+        await client.get_me()
+        account["available"] = True
+        account["session_status"] = "active"
+        account["dead_notified"] = False
+        return "active"
+    except Exception as exc:
+        error_name = type(exc).__name__
+        dead_errors = {
+            "AuthKeyUnregisteredError",
+            "SessionRevokedError",
+            "UserDeactivatedError",
+            "UserDeactivatedBanError",
+            "AuthKeyDuplicatedError",
+        }
+        if error_name in dead_errors:
+            account["available"] = False
+            account["session_status"] = "dead"
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            if notify:
+                await notify_session_dead(account)
+            return "dead"
+
+        account["available"] = False
+        account["session_status"] = "unknown"
+        print(f"Could not verify {account['name']} session: {error_name}")
+        return "unknown"
+
+
+async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_session_admin(update):
+        await update.effective_message.reply_text(
+            "/verify is restricted to configured admins in a private chat."
+        )
+        return
+
+    results = []
+    for account in clients:
+        status = await verify_session(account)
+        if status == "active":
+            results.append(f"✅ {account['name']}: active")
+        elif status == "dead":
+            results.append(f"❌ {account['name']}: session dead/unauthorized — run /generate")
+        else:
+            results.append(f"❔ {account['name']}: check failed temporarily; not marked dead")
+    await update.effective_message.reply_text("\n".join(results))
+
+
+async def session_watchdog():
+    while True:
+        await asyncio.sleep(600)
+        for account in clients:
+            await verify_session(account)
 
 
 async def generate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -547,6 +644,8 @@ async def finish_session_generation(update: Update):
         )
         account["client"] = login.client
         account["available"] = True
+        account["session_status"] = "active"
+        account["dead_notified"] = False
         await send_session_reply(
             update,
             f"✅ {account['name']} session created and saved. The bot can use it now."
@@ -577,9 +676,18 @@ async def cancel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not any(account["available"] for account in clients):
+    statuses = []
+    for account in clients:
+        statuses.append(await verify_session(account))
+    if not any(status == "active" for status in statuses):
+        if any(status == "unknown" for status in statuses):
+            await update.effective_message.reply_text(
+                "I couldn't verify the Telegram sessions because of a temporary connection problem. "
+                "Try again shortly; they have not been marked dead."
+            )
+            return
         await update.effective_message.reply_text(
-            "No Telegram user session is available or authorized. "
+            "The Telegram sessions are dead or unauthorized. "
             "An admin must open a private chat with the bot and run /generate."
         )
         return
@@ -765,13 +873,25 @@ async def download_worker():
             )
 
             if not selected:
+                dead_accounts = [
+                    account["name"]
+                    for account in clients
+                    if account.get("session_status") == "dead"
+                ]
+                if dead_accounts:
+                    unavailable_text = (
+                        "Dead/unauthorized session(s): "
+                        + ", ".join(dead_accounts)
+                        + ". An admin can replace them by running /generate in a private chat."
+                    )
+                else:
+                    unavailable_text = (
+                        "None of the configured accounts can access this message. "
+                        "Use /verify in a private chat to check their sessions."
+                    )
                 await bot.send_message(
                     chat_id=user_id,
-                    text=(
-                        "❌ None of the configured Telegram accounts "
-                        "can access this message. If a user session is missing or expired, "
-                        "an admin can create/renew it in a private chat with /generate."
-                    ),
+                    text=f"❌ {unavailable_text}",
                 )
                 continue
 
@@ -944,6 +1064,8 @@ async def main():
                     config["api_hash"],
                 ),
                 "available": False,
+                "session_status": "unknown",
+                "dead_notified": False,
             }
         )
     bot = Bot(token=BOT_TOKEN)
@@ -951,29 +1073,11 @@ async def main():
     # Start the bot even when user sessions are missing or expired. Admins
     # can create or renew them later with the private /generate flow.
     for account in clients:
-        telethon_client = account["client"]
-        try:
-            await telethon_client.connect()
-            if await telethon_client.is_user_authorized():
-                account["available"] = True
-                me = await telethon_client.get_me()
-                print(
-                    f'{account["name"]} logged in as '
-                    f'{getattr(me, "id", "unknown")}'
-                )
-            else:
-                print(
-                    f'{account["name"]} session is missing or expired. '
-                    'An admin can create it with /generate in a private chat.'
-                )
-                await telethon_client.disconnect()
-        except Exception as exc:
-            account["available"] = False
-            print(f'{account["name"]} session unavailable: {type(exc).__name__}')
-            try:
-                await telethon_client.disconnect()
-            except Exception:
-                pass
+        status = await verify_session(account, notify=False)
+        if status == "active":
+            print(f'{account["name"]} session is active.')
+        elif status == "dead":
+            print(f'{account["name"]} session is dead or unauthorized.')
 
     # Start HTTP server required by Render Web Service.
     web_runner = await start_web_server()
@@ -988,6 +1092,7 @@ async def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("download", download))
+    application.add_handler(CommandHandler("verify", verify_command))
     application.add_handler(CommandHandler("speedtest", speedtest_command))
     application.add_handler(
         ConversationHandler(
@@ -1009,7 +1114,12 @@ async def main():
     await application.start()
     await application.updater.start_polling()
 
+    for account in clients:
+        if account.get("session_status") == "dead":
+            await notify_session_dead(account)
+
     worker_task = asyncio.create_task(download_worker())
+    session_watchdog_task = asyncio.create_task(session_watchdog())
 
     print("🤖 Bot running...")
     print("🌐 /ping endpoint is ready.")
@@ -1020,9 +1130,15 @@ async def main():
 
     finally:
         worker_task.cancel()
+        session_watchdog_task.cancel()
 
         try:
             await worker_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await session_watchdog_task
         except asyncio.CancelledError:
             pass
 
