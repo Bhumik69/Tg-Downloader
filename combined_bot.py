@@ -186,7 +186,10 @@ async def safe_delete_bot_message(chat_id, message_id):
         )
 
 
-async def send_message_to_user(user_id, msg):
+BOT_API_UPLOAD_LIMIT = 50 * 1024 * 1024
+
+
+async def send_message_to_user(user_id, msg, sender_account=None, username=None):
     downloaded_path = None
     progress_id = None
     progress_message = None
@@ -202,7 +205,7 @@ async def send_message_to_user(user_id, msg):
                 "current": 0,
                 "total": 0,
                 "speed_bps": 0,
-                "status": "Starting download...",
+                "status": "Downloading...",
                 "started_at": time.perf_counter(),
                 "last_update": 0.0,
             }
@@ -220,7 +223,6 @@ async def send_message_to_user(user_id, msg):
                 state["current"] = current
                 state["total"] = total or state["total"]
                 state["speed_bps"] = current / elapsed
-                state["status"] = "Downloading..."
 
                 should_update = now - state["last_update"] >= 2.0 or (total and current >= total)
                 if not should_update:
@@ -255,28 +257,66 @@ async def send_message_to_user(user_id, msg):
 
                 caption = msg.text or ""
                 sent_message = None
+                file_size = os.path.getsize(downloaded_path)
+                mime_type = (getattr(getattr(msg, "file", None), "mime_type", "") or "").lower()
+                is_video = bool(getattr(msg, "video", None)) or mime_type.startswith("video/")
+                is_video = is_video or downloaded_path.lower().endswith(
+                    (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
+                )
 
-                with open(downloaded_path, "rb") as media_file:
-                    lower_path = downloaded_path.lower()
+                if is_video and file_size > BOT_API_UPLOAD_LIMIT:
+                    if not sender_account:
+                        raise RuntimeError(
+                            "This video exceeds the bot upload limit and no Telegram sender account is available."
+                        )
 
-                    if lower_path.endswith((".jpg", ".jpeg", ".png")):
-                        sent_message = await bot.send_photo(
-                            chat_id=user_id,
-                            photo=media_file,
-                            caption=caption,
-                        )
-                    elif lower_path.endswith((".mp4", ".mkv")):
-                        sent_message = await bot.send_video(
-                            chat_id=user_id,
-                            video=media_file,
-                            caption=caption,
-                        )
-                    else:
-                        sent_message = await bot.send_document(
-                            chat_id=user_id,
-                            document=media_file,
-                            caption=caption,
-                        )
+                    sender_client = sender_account["client"]
+                    try:
+                        if username:
+                            recipient = await sender_client.get_entity(username)
+                        else:
+                            recipient = await sender_client.get_input_entity(user_id)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "The sender account cannot open a Telegram chat with you. "
+                            "Set a public Telegram username and try again."
+                        ) from exc
+
+                    state["status"] = f"Uploading via {sender_account['name']}..."
+                    state["started_at"] = time.perf_counter()
+                    state["current"] = 0
+                    state["total"] = file_size
+                    state["speed_bps"] = 0
+                    sent_message = await sender_client.send_file(
+                        recipient,
+                        downloaded_path,
+                        caption=caption,
+                        progress_callback=progress_callback,
+                    )
+
+                else:
+                    state["status"] = "Sending to Telegram..."
+                    with open(downloaded_path, "rb") as media_file:
+                        lower_path = downloaded_path.lower()
+
+                        if lower_path.endswith((".jpg", ".jpeg", ".png")):
+                            sent_message = await bot.send_photo(
+                                chat_id=user_id,
+                                photo=media_file,
+                                caption=caption,
+                            )
+                        elif lower_path.endswith((".mp4", ".mkv")):
+                            sent_message = await bot.send_video(
+                                chat_id=user_id,
+                                video=media_file,
+                                caption=caption,
+                            )
+                        else:
+                            sent_message = await bot.send_document(
+                                chat_id=user_id,
+                                document=media_file,
+                                caption=caption,
+                            )
 
                 # Telegram has accepted the final media message.
                 print(
@@ -343,11 +383,16 @@ async def find_accessible_client(chat_id, msg_id):
     return None, None
 
 
-async def process_message_with_client(account, chat_id, msg_id, user_id):
+async def process_message_with_client(account, chat_id, msg_id, user_id, username=None):
     try:
         msg = await account["client"].get_messages(chat_id, ids=msg_id)
         if msg:
-            await send_message_to_user(user_id, msg)
+            await send_message_to_user(
+                user_id,
+                msg,
+                sender_account=account,
+                username=username,
+            )
             return True
     except Exception as exc:
         print(f'{account["name"]} failed on message {msg_id}: {exc}')
@@ -734,6 +779,7 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "link": link,
             "count": count,
             "user_id": user_id,
+            "username": update.effective_user.username,
             # Only bot-generated temporary messages are tracked.
             # The user's original /download message is never deleted.
             "temp_message_ids": [queued_message.message_id],
@@ -849,6 +895,7 @@ async def download_worker():
             link = job["link"]
             count = job["count"]
             user_id = job["user_id"]
+            username = job.get("username")
             temp_message_ids = job.setdefault("temp_message_ids", [])
 
             chat_part, start_id = parse_link(link)
@@ -907,7 +954,12 @@ async def download_worker():
             downloaded = 0
 
             try:
-                await send_message_to_user(user_id, first_msg)
+                await send_message_to_user(
+                    user_id,
+                    first_msg,
+                    sender_account=selected,
+                    username=username,
+                )
                 downloaded = 1
                 current += 1
             except Exception:
@@ -919,6 +971,7 @@ async def download_worker():
                     chat_id,
                     current,
                     user_id,
+                    username=username,
                 )
 
                 if not ok:
@@ -934,6 +987,8 @@ async def download_worker():
                             await send_message_to_user(
                                 user_id,
                                 fallback_msg,
+                                sender_account=fallback,
+                                username=username,
                             )
                             ok = True
                         except Exception as exc:
