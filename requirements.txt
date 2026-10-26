@@ -3,3 +3,4 @@ cryptography
 python-telegram-bot
 Telethon
 python-dotenv
+cryptg>=0.6.0
