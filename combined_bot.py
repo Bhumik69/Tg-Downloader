@@ -186,7 +186,8 @@ async def safe_delete_bot_message(chat_id, message_id):
         )
 
 
-BOT_API_UPLOAD_LIMIT = 50 * 1024 * 1024
+# Leave a little headroom below Telegram's 50 MB Bot API upload cap.
+BOT_API_UPLOAD_LIMIT = 49_000_000
 
 
 async def send_message_to_user(user_id, msg, sender_account=None, username=None):
@@ -200,12 +201,30 @@ async def send_message_to_user(user_id, msg, sender_account=None, username=None)
             return
 
         if msg.media:
+            mime_type = (getattr(getattr(msg, "file", None), "mime_type", "") or "").lower()
+            file_name = (getattr(getattr(msg, "file", None), "name", "") or "").lower()
+            is_video = bool(getattr(msg, "video", None)) or mime_type.startswith("video/")
+            is_video = is_video or file_name.endswith(
+                (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
+            )
+            reported_size = getattr(getattr(msg, "file", None), "size", None)
+
+            # Decide the delivery route from Telegram's message metadata before
+            # downloading any bytes. Oversized videos go straight to Saved Messages.
+            save_to_saved_messages = is_video and (
+                reported_size is None or reported_size > BOT_API_UPLOAD_LIMIT
+            )
+            if save_to_saved_messages and not sender_account:
+                raise RuntimeError(
+                    "This video is too large for the bot upload limit, and no Telegram account is available."
+                )
+
             progress_id = secrets.token_hex(4)
             state = {
                 "current": 0,
-                "total": 0,
+                "total": reported_size or 0,
                 "speed_bps": 0,
-                "status": "Downloading...",
+                "status": "Saving to Saved Messages..." if save_to_saved_messages else "Downloading...",
                 "started_at": time.perf_counter(),
                 "last_update": 0.0,
             }
@@ -216,6 +235,68 @@ async def send_message_to_user(user_id, msg, sender_account=None, username=None)
                 text=build_progress_text(state),
                 reply_markup=progress_keyboard(progress_id),
             )
+
+            if save_to_saved_messages:
+                # Prefer a direct copy into Saved Messages. If forwarding is
+                # restricted for this source, download once through the user
+                # account and upload that file to Saved Messages.
+                sender_client = sender_account["client"]
+                try:
+                    saved = await sender_client.forward_messages(
+                        "me",
+                        msg,
+                        drop_author=True,
+                    )
+                    if not saved:
+                        raise RuntimeError("Telegram did not confirm the save.")
+                    saved_message = saved[0] if isinstance(saved, list) else saved
+                except Exception as forward_error:
+                    print("Direct save/forward unavailable; trying account download:", forward_error)
+                    state["status"] = f"Downloading via {sender_account['name']}..."
+
+                    async def saved_download_progress(current, total):
+                        state["current"] = current
+                        state["total"] = total or state["total"]
+                        elapsed = max(time.perf_counter() - state["started_at"], 0.001)
+                        state["speed_bps"] = current / elapsed
+                        now = time.perf_counter()
+                        if now - state["last_update"] < 2.0 and not (total and current >= total):
+                            return
+                        state["last_update"] = now
+                        try:
+                            await progress_message.edit_text(
+                                build_progress_text(state),
+                                reply_markup=progress_keyboard(progress_id),
+                            )
+                        except Exception:
+                            pass
+
+                    downloaded_path = await msg.download_media(
+                        file=SAVE_DIR,
+                        progress_callback=saved_download_progress,
+                    )
+                    if not downloaded_path:
+                        raise RuntimeError("The account could not download this video.") from forward_error
+                    state["status"] = f"Saving via {sender_account['name']}..."
+                    saved_message = await sender_client.send_file(
+                        "me",
+                        downloaded_path,
+                        caption=msg.text or "",
+                    )
+                print(
+                    f"Saved video from message {getattr(msg, 'id', '?')} to "
+                    f"{sender_account['name']} Saved Messages; message_id: "
+                    f"{getattr(saved_message, 'id', None)}"
+                )
+                state["status"] = "Saved to Saved Messages"
+                state["current"] = state["total"]
+                try:
+                    await progress_message.edit_text(
+                        f"✅ Download successful. Video saved to {sender_account['name']} Saved Messages.",
+                    )
+                except Exception:
+                    pass
+                return
 
             async def progress_callback(current, total):
                 now = time.perf_counter()
@@ -257,66 +338,28 @@ async def send_message_to_user(user_id, msg, sender_account=None, username=None)
 
                 caption = msg.text or ""
                 sent_message = None
-                file_size = os.path.getsize(downloaded_path)
-                mime_type = (getattr(getattr(msg, "file", None), "mime_type", "") or "").lower()
-                is_video = bool(getattr(msg, "video", None)) or mime_type.startswith("video/")
-                is_video = is_video or downloaded_path.lower().endswith(
-                    (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
-                )
+                state["status"] = "Sending with the bot..."
+                with open(downloaded_path, "rb") as media_file:
+                    lower_path = downloaded_path.lower()
 
-                if is_video and file_size > BOT_API_UPLOAD_LIMIT:
-                    if not sender_account:
-                        raise RuntimeError(
-                            "This video exceeds the bot upload limit and no Telegram sender account is available."
+                    if lower_path.endswith((".jpg", ".jpeg", ".png")):
+                        sent_message = await bot.send_photo(
+                            chat_id=user_id,
+                            photo=media_file,
+                            caption=caption,
                         )
-
-                    sender_client = sender_account["client"]
-                    try:
-                        if username:
-                            recipient = await sender_client.get_entity(username)
-                        else:
-                            recipient = await sender_client.get_input_entity(user_id)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            "The sender account cannot open a Telegram chat with you. "
-                            "Set a public Telegram username and try again."
-                        ) from exc
-
-                    state["status"] = f"Uploading via {sender_account['name']}..."
-                    state["started_at"] = time.perf_counter()
-                    state["current"] = 0
-                    state["total"] = file_size
-                    state["speed_bps"] = 0
-                    sent_message = await sender_client.send_file(
-                        recipient,
-                        downloaded_path,
-                        caption=caption,
-                        progress_callback=progress_callback,
-                    )
-
-                else:
-                    state["status"] = "Sending to Telegram..."
-                    with open(downloaded_path, "rb") as media_file:
-                        lower_path = downloaded_path.lower()
-
-                        if lower_path.endswith((".jpg", ".jpeg", ".png")):
-                            sent_message = await bot.send_photo(
-                                chat_id=user_id,
-                                photo=media_file,
-                                caption=caption,
-                            )
-                        elif lower_path.endswith((".mp4", ".mkv")):
-                            sent_message = await bot.send_video(
-                                chat_id=user_id,
-                                video=media_file,
-                                caption=caption,
-                            )
-                        else:
-                            sent_message = await bot.send_document(
-                                chat_id=user_id,
-                                document=media_file,
-                                caption=caption,
-                            )
+                    elif is_video:
+                        sent_message = await bot.send_video(
+                            chat_id=user_id,
+                            video=media_file,
+                            caption=caption,
+                        )
+                    else:
+                        sent_message = await bot.send_document(
+                            chat_id=user_id,
+                            document=media_file,
+                            caption=caption,
+                        )
 
                 # Telegram has accepted the final media message.
                 print(
@@ -327,6 +370,14 @@ async def send_message_to_user(user_id, msg, sender_account=None, username=None)
                 )
 
                 state["status"] = "Completed"
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="✅ Download successful. Video sent to you by the bot."
+                        if is_video else "✅ Download successful. Media sent to you by the bot.",
+                    )
+                except Exception as exc:
+                    print("Could not send download success notice:", exc)
 
                 # Remove the local Render copy immediately after a successful send.
                 if downloaded_path and os.path.exists(downloaded_path):
